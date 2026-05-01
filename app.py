@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import os
 
 st.set_page_config(layout="wide")
-st.title("🔮 Bitcoin Hourly Forecast – AlphaI × Polaris")
+st.title("🔮 Bitcoin Hourly Forecast – Alphai")
 st.markdown("### 95% Prediction Interval for the next hour")
 
 # ---------- Load backtest metrics ----------
@@ -25,7 +25,7 @@ except Exception as e:
     st.error(f"Error loading metrics: {e}")
 
 # ---------- Fetch live Bitcoin data ----------
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=120)
 def get_live_data(limit=500):
     url = f"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1h&limit={limit}"
     resp = requests.get(url)
@@ -38,10 +38,17 @@ def get_live_data(limit=500):
     ])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
-    df['close'] = df['close'].astype(float)
-    # Drop the in-progress candle (last row) to ensure we only use fully closed bars
-    df_closed = df.iloc[:-1].copy().reset_index(drop=True)
-    return df_closed[['timestamp', 'close_time', 'close']]
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = df[col].astype(float)
+        
+    # Only drop the last candle if it is currently forming
+    now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    if df['close_time'].iloc[-1] > now_utc_naive:
+        df_closed = df.iloc[:-1].copy().reset_index(drop=True)
+    else:
+        df_closed = df.copy()
+        
+    return df_closed[['timestamp', 'close_time', 'open', 'high', 'low', 'close', 'volume']]
 
 # ---------- Student-t forecast (with dynamic fitting and scale inflation) ----------
 def gbm_forecast(prices, n_sims=10000, scale_inflate=1.03):
@@ -95,18 +102,65 @@ with st.spinner("Fetching live Bitcoin data..."):
 
         st.subheader("📡 Current Forecast")
         st.write(f"Last **fully closed** 1h bar (UTC): `{last_close_time}`")
-        c4, c5, c6 = st.columns(3)
+        
+        # The UI timer should always count down to the top of the next real-world hour
+        now_utc = datetime.now(timezone.utc)
+        next_top_of_hour = now_utc.replace(minute=0, second=0, microsecond=0) + pd.Timedelta(hours=1)
+        ui_time_rem = next_top_of_hour - now_utc
+        
+        # For background refresh logic, we need to know if the data itself is lagging
+        next_candle_time = last_close_time.replace(tzinfo=timezone.utc) + pd.Timedelta(hours=1)
+        data_time_rem = next_candle_time - now_utc
+
+        c4, c5, c6, c7 = st.columns(4)
         c4.metric("Latest Closed Price", f"${last_price:,.2f}")
         c5.metric("95% Prediction Interval", f"${lower:,.0f} – ${upper:,.0f}")
         c6.metric("Interval Width", f"${upper - lower:,.0f}")
+        
+        with c7:
+            import streamlit.components.v1 as components
+            timer_html = f"""
+            <style>
+                body {{ margin: 0; font-family: "Source Sans Pro", sans-serif; background-color: transparent; }}
+                .metric-label {{ font-size: 14px; color: rgba(250, 250, 250, 0.6); margin-bottom: 4px; }}
+                .metric-value {{ font-size: 1.8rem; font-weight: 400; color: rgb(250, 250, 250); }}
+            </style>
+            <div>
+                <div class="metric-label">⏳ Next Prediction In</div>
+                <div class="metric-value" id="countdown">--m --s</div>
+            </div>
+            <script>
+                var distance = {int(ui_time_rem.total_seconds() * 1000)};
+                function updateTimer() {{
+                    if (distance < 0) {{
+                        document.getElementById("countdown").innerHTML = "0m 0s";
+                    }} else {{
+                        var m = Math.floor((distance % (1000 * 60 * 60)) / (1000 * 60));
+                        var s = Math.floor((distance % (1000 * 60)) / 1000);
+                        document.getElementById("countdown").innerHTML = m + "m " + s + "s";
+                    }}
+                    distance -= 1000;
+                }}
+                updateTimer(); // run immediately
+                setInterval(updateTimer, 1000);
+            </script>
+            """
+            components.html(timer_html, height=80)
 
         # Plot with shaded ribbon using Plotly
         st.subheader("📈 Recent Price Action + Forecast")
         import plotly.graph_objects as go
         plot_df = df.tail(50).copy()
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=plot_df['timestamp'], y=plot_df['close'],
-                                 mode='lines', name='Actual Price', line=dict(color="#f7931a", width=2)))
+        fig.add_trace(go.Candlestick(
+            x=plot_df['timestamp'],
+            open=plot_df['open'],
+            high=plot_df['high'],
+            low=plot_df['low'],
+            close=plot_df['close'],
+            name='Actual Price'
+        ))
+        fig.update_layout(xaxis_rangeslider_visible=False)
         # Shaded region for the predicted hour
         fig.add_hrect(
             y0=lower, y1=upper, line_width=0, fillcolor="rgba(0,128,255,0.15)", name="95% next-hour range"
@@ -133,8 +187,130 @@ with st.spinner("Fetching live Bitcoin data..."):
         
         hist = read_history()
         if hist:
+            hist_df = pd.DataFrame(hist)
+            # Parse dates
+            hist_df['logged_at_utc'] = pd.to_datetime(hist_df['logged_at_utc'])
+            hist_df['anchor_close_time_utc'] = pd.to_datetime(hist_df['anchor_close_time_utc'])
+            
+            # Calculate range width
+            hist_df['range_width'] = hist_df['predict_high'] - hist_df['predict_low']
+            
+            # Target close time is exactly 1 hour after the anchor close time
+            hist_df['target_close_time'] = hist_df['anchor_close_time_utc'] + pd.Timedelta(hours=1)
+            
+            # Map actual close from the current live data (if available)
+            close_map = df.set_index('close_time')['close'].to_dict()
+            hist_df['actual_close'] = hist_df['target_close_time'].map(close_map)
+            
+            # Calculate Winkler Score (alpha = 0.05 for 95% interval)
+            alpha = 0.05
+            def calc_winkler(row):
+                if pd.isna(row['actual_close']):
+                    return np.nan
+                width = row['range_width']
+                actual = row['actual_close']
+                lower = row['predict_low']
+                upper = row['predict_high']
+                
+                if actual < lower:
+                    return width + (2 / alpha) * (lower - actual)
+                elif actual > upper:
+                    return width + (2 / alpha) * (actual - upper)
+                else:
+                    return width
+            
+            hist_df['winkler_score'] = hist_df.apply(calc_winkler, axis=1)
+
+            # Check if prediction was correct
+            def check_hit(row):
+                if pd.isna(row['actual_close']):
+                    return "⏳ Pending"
+                actual = row['actual_close']
+                lower = row['predict_low']
+                upper = row['predict_high']
+                if actual < lower:
+                    return "❌ Miss (Low)"
+                elif actual > upper:
+                    return "❌ Miss (High)"
+                else:
+                    return "✅ Hit"
+
+            hist_df['result'] = hist_df.apply(check_hit, axis=1)
+            
+            # Format pending values nicely
+            hist_df['actual_close_fmt'] = hist_df['actual_close'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "Pending")
+            hist_df['winkler_score_fmt'] = hist_df['winkler_score'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "Pending")
+
+            # Rename columns for proper display
+            rename_dict = {
+                'logged_at_utc': 'Logged At (UTC)',
+                'anchor_close_time_utc': 'Anchor Time (UTC)',
+                's0_close': 'Anchor Close ($)',
+                'predict_low': 'Predict Low ($)',
+                'predict_high': 'Predict High ($)',
+                'range_width': 'Range Width ($)',
+                'actual_close_fmt': 'Actual Close',
+                'winkler_score_fmt': 'Winkler Score',
+                'result': 'Result',
+                'scale_inflate_used': 'Scale Inflate'
+            }
+            display_df = hist_df.rename(columns=rename_dict)
+            
+            # Order the columns nicely
+            cols_order = [
+                'Logged At (UTC)', 'Anchor Time (UTC)', 'Anchor Close ($)', 
+                'Predict Low ($)', 'Predict High ($)', 'Range Width ($)', 
+                'Actual Close', 'Result', 'Winkler Score', 'Scale Inflate'
+            ]
+            display_df = display_df[[c for c in cols_order if c in display_df.columns]]
+            
             st.divider()
-            st.subheader("Visit Log (Part C)")
-            st.dataframe(pd.DataFrame(hist).tail(200), use_container_width=True, height=280)
+            st.subheader("Prediction History & Validation")
+            st.dataframe(
+                display_df, 
+                use_container_width=True, 
+                height=280,
+                column_config={
+                    'Logged At (UTC)': st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm:ss"),
+                    'Anchor Time (UTC)': st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm:ss"),
+                    'Anchor Close ($)': st.column_config.NumberColumn(format="$%.2f"),
+                    'Predict Low ($)': st.column_config.NumberColumn(format="$%.2f"),
+                    'Predict High ($)': st.column_config.NumberColumn(format="$%.2f"),
+                    'Range Width ($)': st.column_config.NumberColumn(format="$%.2f"),
+                    'Actual Close': st.column_config.TextColumn(),
+                    'Result': st.column_config.TextColumn(),
+                    'Winkler Score': st.column_config.TextColumn(),
+                }
+            )
+
+        # Part D: Auto-Refresh using JS injection
+        import streamlit.components.v1 as components
+        if data_time_rem.total_seconds() > 0:
+            # Refresh 15 seconds after the candle closes to ensure Binance API has the new candle
+            refresh_ms = int(data_time_rem.total_seconds() * 1000) + 15000
+            components.html(
+                f"""
+                <script>
+                    setTimeout(function() {{
+                        window.parent.location.reload();
+                    }}, {refresh_ms});
+                </script>
+                """,
+                height=0, width=0
+            )
+        else:
+            # If the time has already passed but we haven't loaded the new bar yet, refresh every 60 seconds
+            # This happens if the Binance Vision API is heavily cached and lagging behind real-time
+            components.html(
+                """
+                <script>
+                    setTimeout(function() {
+                        window.parent.location.reload();
+                    }, 60000);
+                </script>
+                """,
+                height=0, width=0
+            )
+
     else:
         st.error("Failed to fetch data from Binance.")

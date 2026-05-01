@@ -10,7 +10,7 @@ st.set_page_config(layout="wide")
 st.title("🔮 Bitcoin Hourly Forecast – AlphaI × Polaris")
 st.markdown("### 95% Prediction Interval for the next hour")
 
-# ---------- Load your backtest metrics ----------
+# ---------- Load backtest metrics ----------
 try:
     with open("backtest_metrics.json", "r") as f:
         metrics = json.load(f)
@@ -18,13 +18,15 @@ try:
     col1.metric("Coverage (target 95%)", f"{metrics['coverage_95']:.2%}")
     col2.metric("Avg. Width (USD)", f"${metrics['avg_width_95']:.0f}")
     col3.metric("Winkler Score (lower is better)", f"{metrics['mean_winkler_95']:.2f}")
-except:
+except FileNotFoundError:
     st.warning("Backtest metrics not found. Make sure backtest_metrics.json is in the same folder.")
+except Exception as e:
+    st.error(f"Error loading metrics: {e}")
 
 # ---------- Fetch live Bitcoin data ----------
 @st.cache_data(ttl=3600)
 def get_live_data(limit=500):
-    url = "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=" + str(limit)
+    url = f"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1h&limit={limit}"
     resp = requests.get(url)
     resp.raise_for_status()
     data = resp.json()
@@ -37,7 +39,7 @@ def get_live_data(limit=500):
     df['close'] = df['close'].astype(float)
     return df[['timestamp', 'close']]
 
-# ---------- GBM forecast (same as backtest) ----------
+# ---------- GBM forecast (same as your backtest) ----------
 def gbm_forecast(prices, n_sims=10000, nu=4):
     returns = prices.pct_change().dropna()
     if len(returns) < 5:
@@ -53,7 +55,7 @@ def gbm_forecast(prices, n_sims=10000, nu=4):
 
 # ---------- Dashboard UI ----------
 with st.spinner("Fetching live Bitcoin data..."):
-    df = get_live_data(500)
+    df = get_live_data(limit=500)
     if not df.empty:
         lower, upper = gbm_forecast(df['close'])
         last_price = df['close'].iloc[-1]
@@ -79,4 +81,4 @@ with st.spinner("Fetching live Bitcoin data..."):
         fig.update_layout(xaxis_title="Time", yaxis_title="BTC Price (USD)")
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.error("Failed to fetch data.")
+        st.error("Failed to fetch data from Binance.")

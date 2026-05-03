@@ -1,1 +1,1 @@
-{"coverage_95": 0.9598393574297188, "avg_width_95": 1745.8128138752584, "mean_winkler_95": 1765.1641416447933, "n_predictions": 249}
+{"coverage_95": 0.9558232931726908, "avg_width_95": 1458.3966461425455, "mean_winkler_95": 1487.7501457177082, "n_predictions": 249,"calibration_factor": 0.99390756302521}
